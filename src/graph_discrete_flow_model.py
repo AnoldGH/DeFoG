@@ -61,7 +61,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         self.extra_features = extra_features
         self.domain_features = domain_features
 
-        self.noise_dist = NoiseDistribution(cfg.model.transition, dataset_infos)
+        self.noise_dist = NoiseDistribution(cfg.model.transition, dataset_infos, cfg=cfg)
         self.limit_dist = self.noise_dist.get_limit_dist()
 
         # add virtual class when absorbing state refers to a new class
@@ -485,7 +485,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         else:
             assert isinstance(num_nodes, torch.Tensor)
             n_nodes = num_nodes
-        n_max = torch.max(n_nodes).item()
+        n_max = int(torch.max(n_nodes).item())
+        # Inflate n_max so ring nodes have free slots to occupy.
+        if self.cfg.model.transition in ("motif_edited_A", "motif_edited_B"):
+            ring_budget = sum(rs * rc for rs, rc in self.cfg.model.motif_ring_specs)
+            n_max += ring_budget
 
         # Build the masks
         arange = (
@@ -494,9 +498,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         node_mask = arange < n_nodes.unsqueeze(1)
 
         # Sample noise  -- z has size (n_samples, n_nodes, n_features)
-        z_T = flow_matching_utils.sample_discrete_feature_noise(
-            limit_dist=self.noise_dist.get_limit_dist(), node_mask=node_mask
-        )
+        z_T, node_mask = self.noise_dist.sample_initial_noise(node_mask)
         if self.conditional:
             if "qm9" in self.cfg.dataset.name:
                 y = self.test_labels

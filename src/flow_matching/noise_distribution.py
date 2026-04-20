@@ -1,11 +1,13 @@
 import torch
 
 from src import utils
+from flow_matching import flow_matching_utils
+from flow_matching.motif_editor import add_rings
 
 
 class NoiseDistribution:
 
-    def __init__(self, model_transition, dataset_infos):
+    def __init__(self, model_transition, dataset_infos, cfg=None):
 
         self.x_num_classes = dataset_infos.output_dims["X"]
         self.e_num_classes = dataset_infos.output_dims["E"]
@@ -62,6 +64,25 @@ class NoiseDistribution:
             edge_types = dataset_infos.edge_types.float()
             e_limit = edge_types / torch.sum(edge_types)
 
+        elif model_transition == "motif_edited_A":
+            # Original marginals — used to sample z_T before ring edits and
+            # as the distribution passed to add_rings.
+            node_types = dataset_infos.node_types.float()
+            original_x = node_types / node_types.sum()
+            edge_types = dataset_infos.edge_types.float()
+            original_e = edge_types / edge_types.sum()
+            # y_limit is set below; use a zero-length placeholder here so the
+            # original_limit_dist can be constructed after y_limit is assigned.
+            self._original_x = original_x
+            self._original_e = original_e
+
+            # Precomputed edited marginals — used as limit_dist for the rate matrix.
+            saved = torch.load(cfg.model.motif_marginals_path, map_location="cpu", weights_only=True)
+            x_limit = saved["X"]
+            e_limit = saved["E"]
+
+            self.ring_specs = [tuple(rs) for rs in cfg.model.motif_ring_specs]
+
         elif model_transition == "edge_marginal":
             x_limit = torch.ones(self.x_num_classes) / self.x_num_classes
 
@@ -82,6 +103,33 @@ class NoiseDistribution:
             f"Limit distribution of the classes | Nodes: {x_limit} | Edges: {e_limit}"
         )
         self.limit_dist = utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
+
+        if model_transition == "motif_edited_A":
+            self.original_limit_dist = utils.PlaceHolder(
+                X=self._original_x, E=self._original_e, y=y_limit
+            )
+
+    def sample_initial_noise(self, node_mask):
+        """Sample z_T and return (z_T, node_mask).
+
+        For motif_edited_A: samples from the original marginal then applies
+        add_rings, returning the edited graph and the updated node_mask.
+        For all other transitions: delegates to sample_discrete_feature_noise
+        and returns node_mask unchanged.
+        """
+        if self.transition == "motif_edited_A":
+            device = node_mask.device
+            orig = utils.PlaceHolder(
+                X=self.original_limit_dist.X.to(device),
+                E=self.original_limit_dist.E.to(device),
+                y=self.original_limit_dist.y.to(device),
+            )
+            z = flow_matching_utils.sample_discrete_feature_noise(orig, node_mask)
+            z, updated_mask = add_rings(z, node_mask, self.ring_specs, orig)
+            return z, updated_mask
+        else:
+            z = flow_matching_utils.sample_discrete_feature_noise(self.limit_dist, node_mask)
+            return z, node_mask
 
     def update_input_output_dims(self, input_dims):
         input_dims["X"] += self.x_added_classes
