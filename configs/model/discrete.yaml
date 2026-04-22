@@ -14,3 +14,10 @@ hidden_dims : {'dx': 256, 'de': 64, 'dy': 64, 'n_head': 8, 'dim_ffX': 256, 'dim_
 
 # training weight for edges, y, and nodes
 lambda_train: [5, 0]              # X=1, E = lambda[0], y = lambda[1]
+
+# Motif editing (used by motif_edited_A and motif_edited_B transitions)
+# motif_ring_specs: list of [ring_size, count] pairs, e.g. [[6, 1]] or [[5, 1], [6, 2]]
+motif_ring_specs: null
+motif_marginals_path: null        # path to .pt file produced by compute_motif_marginals.py
+motif_num_samples: 10000          # graphs sampled when computing edited marginals
+motif_sample_batch_size: 256
