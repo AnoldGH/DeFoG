@@ -29,7 +29,7 @@ class SpectreGraphDataset(InMemoryDataset):
         self.dataset_name = dataset_name
         self.split = split
         super().__init__(root, transform, pre_transform, pre_filter)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
         self.num_graphs = len(self.data.n_nodes)
 
     @property
@@ -191,7 +191,7 @@ class SpectreGraphDataset(InMemoryDataset):
         raw_dataset = torch.load(self.raw_paths[file_idx[self.split]])
 
         data_list = []
-        for adj in raw_dataset:
+        for idx, adj in enumerate(raw_dataset):
             n = adj.shape[-1]
             X = torch.ones(n, 1, dtype=torch.float)
             y = torch.zeros([1, 0]).float()
@@ -202,6 +202,7 @@ class SpectreGraphDataset(InMemoryDataset):
             data = torch_geometric.data.Data(
                 x=X, edge_index=edge_index, edge_attr=edge_attr, y=y, n_nodes=num_nodes
             )
+            data.idx = torch.tensor([idx], dtype=torch.long)
 
             if self.pre_filter is not None and not self.pre_filter(data):
                 continue

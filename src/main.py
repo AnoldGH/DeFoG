@@ -16,7 +16,12 @@ from pytorch_lightning.utilities.warnings import PossibleUserWarning
 from src import utils
 from metrics.abstract_metrics import TrainAbstractMetricsDiscrete
 from graph_discrete_flow_model import GraphDiscreteFlowModel
-from models.extra_features import DummyExtraFeatures, ExtraFeatures
+from models.extra_features import (
+    CombinedExtraFeatures,
+    DummyExtraFeatures,
+    ExtraFeatures,
+    SubgraphEmbeddingFeatures,
+)
 
 
 warnings.filterwarnings("ignore", category=PossibleUserWarning)
@@ -69,6 +74,19 @@ def main(cfg: DictConfig):
             cfg.model.rrwp_steps,
             dataset_info=dataset_infos,
         )
+        subgraph_emb_path = cfg.model.get("subgraph_emb_path", None)
+        if subgraph_emb_path:
+            extra_features = CombinedExtraFeatures(
+                extra_features,
+                SubgraphEmbeddingFeatures(
+                    subgraph_emb_path,
+                    pooling=list(cfg.model.get("subgraph_pooling", ["max"])),
+                    cfg_dropout=cfg.model.get("subgraph_cfg_dropout", 0.1),
+                    aggregation_prob=cfg.model.get("subgraph_aggregation_prob", 0.2),
+                    aggregation_k_max=cfg.model.get("subgraph_aggregation_k_max", 3),
+                    anchor_aug_prob=cfg.model.get("subgraph_anchor_aug_prob", 0.3),
+                ),
+            )
         domain_features = DummyExtraFeatures()
 
         dataset_infos.compute_input_output_dims(

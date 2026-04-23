@@ -134,6 +134,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         dense_data = dense_data.mask(node_mask)
         X, E = dense_data.X, dense_data.E
         noisy_data = self.apply_noise(X, E, data.y, node_mask)
+        if hasattr(data, "idx"):
+            noisy_data["idx"] = data.idx
+        noisy_data["subgraph_training"] = True
         extra_data = self.compute_extra_data(noisy_data)
         pred = self.forward(noisy_data, extra_data, node_mask)
 
@@ -242,12 +245,21 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             self.search_hyperparameters()
         else:
             print("Starting to sample")
+            test_t0 = time.time()
             samples, labels = self.sample(
                 is_test=True,
                 save_samples=self.cfg.general.save_samples,
                 save_visualization=True,
             )
+            sample_done = time.time()
             to_log = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
+            eval_done = time.time()
+            self.print(
+                f"[TIMER] test epoch: sample={sample_done - test_t0:.1f}s  "
+                f"evaluate={eval_done - sample_done:.1f}s  "
+                f"total={eval_done - test_t0:.1f}s",
+                flush=True,
+            )
 
             # Store results
             filename = os.path.join(
@@ -290,9 +302,22 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             samples_left_to_save = self.cfg.general.samples_to_save
             chains_left_to_save = self.cfg.general.chains_to_save
 
+        # Inference conditioning config (Phase 5/6). Silently no-op if the model
+        # isn't trained with SubgraphEmbeddingFeatures.
+        sub_feats = self._maybe_get_subgraph_feats()
+        sub_mode = self.cfg.general.get("subgraph_inference_mode", None)
+        sub_scale = float(self.cfg.general.get("subgraph_guidance_scale", 1.0))
+        if sub_feats is not None and sub_mode not in (None, "none", "null"):
+            self.print(
+                f"[SUBCOND] mode={sub_mode} guidance_scale={sub_scale} "
+                f"feature_dim={sub_feats.feature_dim}",
+                flush=True,
+            )
+
         samples = []
         labels = []
         graph_id = 0
+        sample_t0 = time.time()
         while samples_left_to_generate > 0:
             self.print(
                 f"Samples left to generate: {samples_left_to_generate}/"
@@ -305,6 +330,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             to_save = min(samples_left_to_save, bs)
             chains_save = min(chains_left_to_save, bs)
             num_chain_steps = min(self.number_chain_steps, self.sample_T)
+            subgraph_cond = self._build_subgraph_cond(
+                sub_feats, sub_mode, to_generate, graph_id
+            )
+            batch_t0 = time.time()
             cur_samples, cur_labels = self.sample_batch(
                 graph_id,
                 to_generate,
@@ -313,6 +342,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 keep_chain=chains_save,
                 number_chain_steps=num_chain_steps,
                 save_visualization=save_visualization,
+                subgraph_cond=subgraph_cond,
+                subgraph_guidance_scale=sub_scale,
+            )
+            batch_elapsed = time.time() - batch_t0
+            self.print(
+                f"[TIMER] sample_batch graphs={to_generate} "
+                f"cfg={'on' if sub_scale != 1.0 else 'off'} "
+                f"elapsed={batch_elapsed:.1f}s",
+                flush=True,
             )
             samples.extend(cur_samples)
             labels.extend(cur_labels)
@@ -321,6 +359,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             samples_left_to_save -= to_save
             samples_left_to_generate -= to_generate
             chains_left_to_save -= chains_save
+        self.print(
+            f"[TIMER] sampling total={time.time() - sample_t0:.1f}s "
+            f"graphs={graph_id}",
+            flush=True,
+        )
 
         if save_samples:
             self.print("Saving the generated graphs")
@@ -456,6 +499,65 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         y = torch.hstack((noisy_data["y_t"], extra_data.y)).float()
         return self.model(X, E, y, node_mask)
 
+    def _maybe_get_subgraph_feats(self):
+        """Return the SubgraphEmbeddingFeatures instance if this model uses one.
+
+        Walks self.extra_features, which may be a CombinedExtraFeatures wrapping
+        multiple feature objects.
+        """
+        from models.extra_features import (
+            CombinedExtraFeatures,
+            SubgraphEmbeddingFeatures,
+        )
+
+        ef = self.extra_features
+        if isinstance(ef, SubgraphEmbeddingFeatures):
+            return ef
+        if isinstance(ef, CombinedExtraFeatures):
+            for f in ef.features:
+                if isinstance(f, SubgraphEmbeddingFeatures):
+                    return f
+        return None
+
+    def _build_subgraph_cond(self, sub_feats, mode, bs, graph_id):
+        """Construct subgraph_cond for a sample batch based on cfg.general.subgraph_*.
+
+        Deterministic: seeded from train.seed + graph_id so each batch of an eval
+        run is reproducible. Returns None for disabled / missing paths so the
+        model falls back to the zero/null extra-feature branch.
+        """
+        if sub_feats is None or mode in (None, "none", "null"):
+            return None
+        import inference_utils as iu
+
+        device = self.device
+        N = sub_feats.precomputed.shape[0]
+        seed = int(self.cfg.train.seed) + int(graph_id)
+        g = torch.Generator().manual_seed(seed)
+        if mode == "idx":
+            idx = torch.randint(0, N, (bs,), generator=g)
+            return iu.from_idx(sub_feats, idx, device)
+        if mode == "idx_max":
+            k = int(self.cfg.general.get("subgraph_inference_k", 3))
+            idx_matrix = torch.randint(0, N, (bs, k), generator=g)
+            return iu.from_idx_max(sub_feats, idx_matrix, device)
+        if mode == "anchor":
+            # TODO: placeholder — generates a random 64-d "motif" vector per
+            # sample. Not a real controllability experiment: (a) should accept a
+            # user-supplied motif embedding via config/file, and (b) layout
+            # doesn't match training (train pattern has per-size embeddings
+            # [S, H]; here we tile one H-dim vec uniformly across all size slots).
+            # See SubgraphEmbeddingFeatures._pattern_for single-anchor branch.
+            anchor = torch.randn(bs, sub_feats.hidden_dim, generator=g)
+            default_n = int(sub_feats.n_nodes.float().median().item())
+            n_nodes = torch.full(
+                (bs,),
+                int(self.cfg.general.get("subgraph_inference_n_nodes", default_n)),
+                dtype=torch.long,
+            )
+            return iu.from_anchor_emb(sub_feats, anchor, n_nodes, device)
+        raise ValueError(f"Unknown subgraph_inference_mode: {mode}")
+
     @torch.no_grad()
     def sample_batch(
         self,
@@ -466,6 +568,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         save_final: int,
         num_nodes=None,
         save_visualization: bool = True,
+        subgraph_cond=None,
+        subgraph_guidance_scale: float = 1.0,
     ):
         """
         :param batch_id: int
@@ -560,6 +664,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 E,
                 y,
                 node_mask,
+                subgraph_cond=subgraph_cond,
+                subgraph_guidance_scale=subgraph_guidance_scale,
             )
 
             X, E, y = sampled_s.X, sampled_s.E, sampled_s.y
@@ -671,6 +777,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         E_t,
         y_t,
         node_mask,
+        subgraph_cond=None,
+        subgraph_guidance_scale: float = 1.0,
         # , condition
     ):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
@@ -687,12 +795,35 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "t": t,
             "node_mask": node_mask,
         }
+        if subgraph_cond is not None:
+            noisy_data["subgraph_cond"] = subgraph_cond
 
-        extra_data = self.compute_extra_data(noisy_data)
-        pred = self.forward(noisy_data, extra_data, node_mask)
-        # Normalize predictions
-        pred_X = F.softmax(pred.X, dim=-1)  # bs, n, d0
-        pred_E = F.softmax(pred.E, dim=-1)  # bs, n, n, d0
+        use_subgraph_cfg = (
+            subgraph_cond is not None and subgraph_guidance_scale != 1.0
+        )
+        if use_subgraph_cfg:
+            # Conditional forward
+            extra_data = self.compute_extra_data(noisy_data)
+            pred_c = self.forward(noisy_data, extra_data, node_mask)
+            # Unconditional forward: swap cond with zeros of the same shape
+            noisy_data["subgraph_cond"] = torch.zeros_like(subgraph_cond)
+            extra_data_u = self.compute_extra_data(noisy_data)
+            pred_u = self.forward(noisy_data, extra_data_u, node_mask)
+            # Restore cond for downstream DeFoG-native CFG (y_t) path
+            noisy_data["subgraph_cond"] = subgraph_cond
+            w = subgraph_guidance_scale
+            pred_X_logits = pred_u.X + w * (pred_c.X - pred_u.X)
+            pred_E_logits = pred_u.E + w * (pred_c.E - pred_u.E)
+            pred_X = F.softmax(pred_X_logits, dim=-1)
+            pred_E = F.softmax(pred_E_logits, dim=-1)
+            # keep pred alias for any downstream reads
+            pred = pred_c
+        else:
+            extra_data = self.compute_extra_data(noisy_data)
+            pred = self.forward(noisy_data, extra_data, node_mask)
+            # Normalize predictions
+            pred_X = F.softmax(pred.X, dim=-1)  # bs, n, d0
+            pred_E = F.softmax(pred.E, dim=-1)  # bs, n, n, d0
         limit_x = self.limit_dist.X
         limit_e = self.limit_dist.E
 

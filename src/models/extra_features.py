@@ -1,5 +1,180 @@
+import math
+
 import torch
 from src import utils
+
+
+_REDUCTIONS = {
+    "mean": lambda x: x.mean(dim=0),
+    "max": lambda x: x.max(dim=0).values,
+    "min": lambda x: x.min(dim=0).values,
+    "std": lambda x: x.std(dim=0, unbiased=False),
+}
+
+
+def _parse_reduction(name):
+    """Return a callable that reduces [n, S, H] -> [S, H] over the anchor axis."""
+    if name in _REDUCTIONS:
+        return _REDUCTIONS[name]
+    if name.startswith("q") and name[1:].isdigit():
+        q = int(name[1:]) / 100.0
+        if not 0.0 <= q <= 1.0:
+            raise ValueError(f"quantile out of range: {name}")
+        return lambda x, q=q: x.quantile(q, dim=0)
+    raise ValueError(f"unknown pooling reduction: {name!r}")
+
+
+class SubgraphEmbeddingFeatures:
+    """Graph-level conditioning from precomputed SPMiner order embeddings.
+
+    Lookup path: `noisy_data["idx"]` -> pattern vector (concat of size-wise
+    per-anchor-pool SPMiner embeddings for each reduction in `pooling`) +
+    log(n_nodes). Returned via y; X and E empty.
+
+    Training augmentation (noisy_data["subgraph_training"] == True), per row:
+      - `cfg_dropout` prob: replace with zeros (CFG null token)
+      - `aggregation_prob` prob: elementwise-max with 1..k-1 other graphs'
+        pattern vectors (keeps own log_n — size is the target, not aggregated)
+      - `anchor_aug_prob` prob: substitute a single-anchor vector (all pool
+        slots collapse to the anchor value — consistent with "n_anchors=1")
+
+    Eval / sampling: deterministic lookup (no augmentation). If no idx and no
+    `subgraph_cond` override, returns zeros.
+
+    `pooling` is an ordered list of reduction names applied across anchors.
+    Supported: "mean", "max", "min", "std", or "qNN" for quantile (e.g. "q25").
+    Result dim = len(pooling) * len(sizes) * hidden_dim + 1 (+1 = log_n).
+    """
+
+    def __init__(
+        self,
+        emb_path,
+        pooling=("max",),
+        cfg_dropout=0.1,
+        aggregation_prob=0.2,
+        aggregation_k_max=3,
+        anchor_aug_prob=0.3,
+    ):
+        data = torch.load(emb_path, weights_only=False)
+        self.n_nodes = data["n_nodes"].long()  # [N]
+        self.per_anchor = data.get("per_anchor", None)  # list of [n_i, S, 64]
+        if self.per_anchor is None:
+            raise ValueError(
+                "SubgraphEmbeddingFeatures requires 'per_anchor' in the embedding file; "
+                "re-run Phase 2 precomputation with per-anchor storage."
+            )
+        self.sizes = list(data["sizes"])
+        self.hidden_dim = self.per_anchor[0].shape[-1]
+        self.pooling = list(pooling)
+        self.reductions = [_parse_reduction(r) for r in self.pooling]
+        n_red = len(self.reductions)
+        n_sizes = len(self.sizes)
+        self.pattern_dim = n_red * n_sizes * self.hidden_dim
+        self.feature_dim = self.pattern_dim + 1
+        self.log_max_n = math.log(float(self.n_nodes.max().item()))
+        self.cfg_dropout = cfg_dropout
+        self.aggregation_prob = aggregation_prob
+        self.aggregation_k_max = aggregation_k_max
+        self.anchor_aug_prob = anchor_aug_prob
+
+        # Precompute per-graph pattern: [N, n_red * n_sizes * hidden_dim].
+        # For each graph, for each reduction, reduce along anchor axis per size.
+        N = len(self.per_anchor)
+        self.precomputed = torch.zeros(N, self.pattern_dim)
+        for g, per in enumerate(self.per_anchor):  # per: [n_i, S, H]
+            slots = []
+            for red in self.reductions:
+                pooled = red(per.float())  # [S, H]
+                slots.append(pooled.reshape(-1))  # [S*H]
+            self.precomputed[g] = torch.cat(slots, dim=0)  # [n_red*S*H]
+
+    def _log_n(self, idx):
+        return torch.log(self.n_nodes[idx].float()) / self.log_max_n
+
+    def _pattern_for(self, gid, use_random_anchor):
+        """Return a [pattern_dim] tensor for graph `gid` (CPU)."""
+        if use_random_anchor and self.per_anchor is not None:
+            per = self.per_anchor[gid]  # [n, S, H]
+            a = int(torch.randint(0, per.shape[0], (1,)).item())
+            single = per[a].reshape(-1).float()  # [S*H]
+            # For a single anchor, every reduction collapses to the anchor value.
+            return single.repeat(len(self.reductions))  # [n_red*S*H]
+        return self.precomputed[gid]  # [n_red*S*H]
+
+    def _build_row(self, own_gid, N_total):
+        """Sample one row: returns ([pattern_dim], scalar log_n)."""
+        r = float(torch.rand(1).item())
+        own_log_n = self._log_n(own_gid)
+
+        if r < self.cfg_dropout:
+            return torch.zeros(self.pattern_dim), torch.zeros(())  # null row (own log_n dropped too)
+
+        use_rand_anchor = float(torch.rand(1).item()) < self.anchor_aug_prob
+        own_pat = self._pattern_for(own_gid, use_rand_anchor)
+
+        if r < self.cfg_dropout + self.aggregation_prob and self.aggregation_k_max > 1:
+            k_extra = int(torch.randint(1, self.aggregation_k_max, (1,)).item())
+            extra_gids = torch.randint(0, N_total, (k_extra,)).tolist()
+            pats = [own_pat]
+            for g in extra_gids:
+                use_ra = float(torch.rand(1).item()) < self.anchor_aug_prob
+                pats.append(self._pattern_for(g, use_ra))
+            own_pat = torch.stack(pats, dim=0).max(dim=0).values
+
+        return own_pat, own_log_n
+
+    def _training_lookup(self, idx, device):
+        N_total = self.precomputed.shape[0]
+        pat_rows, size_rows = [], []
+        for gid in idx.tolist():
+            pat, log_n = self._build_row(int(gid), N_total)
+            pat_rows.append(pat)
+            size_rows.append(log_n)
+        pat = torch.stack(pat_rows, dim=0).to(device)  # [bs, S*64]
+        log_n = torch.stack(size_rows, dim=0).unsqueeze(-1).to(device)  # [bs, 1]
+        return torch.cat([pat, log_n], dim=-1).float()
+
+    def _deterministic_lookup(self, idx, device):
+        vec = self.precomputed[idx].to(device)  # [bs, pattern_dim]
+        log_n = self._log_n(idx).to(device).unsqueeze(-1)  # [bs, 1]
+        return torch.cat([vec, log_n], dim=-1).float()
+
+    def __call__(self, noisy_data):
+        X = noisy_data["X_t"]
+        E = noisy_data["E_t"]
+        bs = X.shape[0]
+        device = X.device
+
+        override = noisy_data.get("subgraph_cond", None)
+        if override is not None:
+            y = override.to(device).float()
+        elif "idx" in noisy_data and noisy_data["idx"] is not None:
+            idx = noisy_data["idx"].cpu().long()
+            if noisy_data.get("subgraph_training", False):
+                y = self._training_lookup(idx, device)
+            else:
+                y = self._deterministic_lookup(idx, device)
+        else:
+            y = torch.zeros(bs, self.feature_dim, device=device)
+
+        empty_x = X.new_zeros((*X.shape[:-1], 0))
+        empty_e = E.new_zeros((*E.shape[:-1], 0))
+        return utils.PlaceHolder(X=empty_x, E=empty_e, y=y)
+
+
+class CombinedExtraFeatures:
+    """Call multiple ExtraFeatures-style callables and concat their outputs."""
+
+    def __init__(self, *features):
+        self.features = features
+
+    def __call__(self, noisy_data):
+        outs = [f(noisy_data) for f in self.features]
+        return utils.PlaceHolder(
+            X=torch.cat([o.X for o in outs], dim=-1),
+            E=torch.cat([o.E for o in outs], dim=-1),
+            y=torch.cat([o.y for o in outs], dim=-1),
+        )
 
 
 class DummyExtraFeatures:

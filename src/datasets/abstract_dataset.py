@@ -134,6 +134,8 @@ class AbstractDatasetInfos:
             "y_t": example_batch["y"],
             "node_mask": node_mask,
         }
+        if hasattr(example_batch, "idx"):
+            example_data["idx"] = example_batch.idx
         self.input_dims = {
             "X": example_batch["x"].size(1),
             "E": example_batch["edge_attr"].size(1),

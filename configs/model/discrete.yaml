@@ -6,6 +6,19 @@ n_layers: 5
 extra_features: 'rrwp'        # 'all', 'cycles', 'eigenvalues', 'rrwp', 'rrwp_comp' or null
 rrwp_steps: 12
 
+# Optional SPMiner subgraph-embedding conditioning. If non-null, points at a
+# precomputed .pt file (see integration/scripts/phase2_precompute_embeddings.py).
+# Final y-feature dim = len(pooling) * len(sizes) * 64 + 1.
+subgraph_emb_path: null
+# Per-anchor aggregations applied per size. Supported: max, min, mean, std, qNN
+# (e.g. q25). Order matters; each entry contributes len(sizes)*64 dims.
+subgraph_pooling: ['max']
+# Per-row probabilities for training-time augmentation (ignored at eval):
+subgraph_cfg_dropout: 0.1             # replace with null (zeros) -> enables CFG
+subgraph_aggregation_prob: 0.2        # elementwise-max with k other graphs
+subgraph_aggregation_k_max: 3         # exclusive upper bound on number of extras
+subgraph_anchor_aug_prob: 0.3         # substitute random-anchor vector for pooled
+
 # Do not set hidden_mlp_E, dim_ffE too high, computing large tensors on the edges is costly
 hidden_mlp_dims: {'X': 256, 'E': 128, 'y': 128}
 
