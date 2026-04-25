@@ -2,7 +2,7 @@ import torch
 
 from src import utils
 from flow_matching import flow_matching_utils
-from flow_matching.motif_editor import add_rings
+from flow_matching.motif_editor import add_rings, add_motif_patterns
 
 
 class NoiseDistribution:
@@ -83,6 +83,44 @@ class NoiseDistribution:
 
             self.ring_specs = [tuple(rs) for rs in cfg.model.motif_ring_specs]
 
+        elif model_transition == "motif_edited_spminer":
+            import pickle
+
+            # Original marginals — used to sample z_T before motif injection and
+            # as the distribution passed to add_motif_patterns.
+            node_types = dataset_infos.node_types.float()
+            original_x = node_types / node_types.sum()
+            edge_types = dataset_infos.edge_types.float()
+            original_e = edge_types / edge_types.sum()
+            self._original_x = original_x
+            self._original_e = original_e
+
+            # Precomputed edited marginals — used as limit_dist for the rate matrix.
+            saved = torch.load(cfg.model.motif_marginals_path, map_location="cpu", weights_only=True)
+            x_limit = saved["X"]
+            e_limit = saved["E"]
+
+            # Load SPMiner-mined motif patterns.
+            with open(cfg.model.spminer_motifs_path, "rb") as f:
+                self.motif_graphs = pickle.load(f)
+            self.spminer_top_k = cfg.model.spminer_top_k
+
+        elif model_transition == "loaded_marginal":
+            # Drop-in replacement for "marginal" that reads precomputed x_limit / e_limit
+            # from a .pt file instead of deriving them from dataset statistics.
+            # z_T is sampled factorised from these marginals (no motif injection,
+            # no graph-size inflation).  The only effect relative to "marginal" is
+            # that the rate matrix is built from the loaded values.
+            if cfg.model.motif_marginals_path is None:
+                raise ValueError(
+                    "transition='loaded_marginal' requires model.motif_marginals_path to be set."
+                )
+            saved = torch.load(
+                cfg.model.motif_marginals_path, map_location="cpu", weights_only=True
+            )
+            x_limit = saved["X"]
+            e_limit = saved["E"]
+
         elif model_transition == "edge_marginal":
             x_limit = torch.ones(self.x_num_classes) / self.x_num_classes
 
@@ -104,20 +142,40 @@ class NoiseDistribution:
         )
         self.limit_dist = utils.PlaceHolder(X=x_limit, E=e_limit, y=y_limit)
 
-        if model_transition == "motif_edited_A":
+        if model_transition in ("motif_edited_A", "motif_edited_spminer"):
             self.original_limit_dist = utils.PlaceHolder(
                 X=self._original_x, E=self._original_e, y=y_limit
             )
+
+    @property
+    def node_budget(self) -> int:
+        """Extra node slots needed to accommodate injected motif nodes.
+
+        Used by graph_discrete_flow_model to inflate n_max so that there are
+        always enough free padding positions for motif injection.
+
+        Returns 0 for non-motif transitions.
+        """
+        if self.transition in ("motif_edited_A", "motif_edited_B"):
+            return sum(rs * rc for rs, rc in self.ring_specs)
+        if self.transition == "motif_edited_spminer":
+            return sum(
+                G.number_of_nodes()
+                for G in self.motif_graphs[: self.spminer_top_k]
+            )
+        return 0
 
     def sample_initial_noise(self, node_mask):
         """Sample z_T and return (z_T, node_mask).
 
         For motif_edited_A: samples from the original marginal then applies
         add_rings, returning the edited graph and the updated node_mask.
+        For motif_edited_spminer: samples from the original marginal then
+        applies add_motif_patterns.
         For all other transitions: delegates to sample_discrete_feature_noise
         and returns node_mask unchanged.
         """
-        if self.transition == "motif_edited_A":
+        if self.transition in ("motif_edited_A", "motif_edited_spminer"):
             device = node_mask.device
             orig = utils.PlaceHolder(
                 X=self.original_limit_dist.X.to(device),
@@ -125,7 +183,12 @@ class NoiseDistribution:
                 y=self.original_limit_dist.y.to(device),
             )
             z = flow_matching_utils.sample_discrete_feature_noise(orig, node_mask)
-            z, updated_mask = add_rings(z, node_mask, self.ring_specs, orig)
+            if self.transition == "motif_edited_A":
+                z, updated_mask = add_rings(z, node_mask, self.ring_specs, orig)
+            else:
+                z, updated_mask = add_motif_patterns(
+                    z, node_mask, self.motif_graphs, orig, top_k=self.spminer_top_k
+                )
             return z, updated_mask
         else:
             z = flow_matching_utils.sample_discrete_feature_noise(self.limit_dist, node_mask)

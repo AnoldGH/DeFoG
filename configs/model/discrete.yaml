@@ -21,3 +21,8 @@ motif_ring_specs: null
 motif_marginals_path: null        # path to .pt file produced by compute_motif_marginals.py
 motif_num_samples: 10000          # graphs sampled when computing edited marginals
 motif_sample_batch_size: 256
+
+# SPMiner motif mining (used by motif_edited_spminer transition — Part 2)
+spminer_nx_graphs_path: null    # output of scripts/export_nx_graphs.py
+spminer_motifs_path: null       # output of scripts/mine_motifs.py
+spminer_top_k: 3                # top-K mined patterns to inject per graph
