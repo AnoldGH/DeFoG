@@ -60,6 +60,13 @@ def load_dataset_infos(cfg):
     elif "zinc" in dataset_name:
         from datasets import zinc_dataset
         return zinc_dataset.ZINCinfos(datamodule=None, cfg=cfg)
+    elif dataset_name in ("planar", "sbm", "tree", "comm20", "ego", "imdb", "protein"):
+        # Spectre datasets don't expose hardcoded type distributions, so we
+        # need to construct a real datamodule (which downloads/processes the
+        # graphs the first time it's run).
+        from datasets import spectre_dataset
+        datamodule = spectre_dataset.SpectreGraphDataModule(cfg)
+        return spectre_dataset.SpectreDatasetInfos(datamodule, cfg.dataset)
     else:
         raise ValueError(f"Dataset '{dataset_name}' not supported for motif marginal precomputation.")
 

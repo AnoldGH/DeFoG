@@ -44,6 +44,9 @@ def build_datamodule(cfg):
     elif dataset_name == "moses":
         from datasets import moses_dataset
         return moses_dataset.MOSESDataModule(cfg)
+    elif dataset_name in ("planar", "sbm", "tree", "comm20", "ego", "imdb", "protein"):
+        from datasets import spectre_dataset
+        return spectre_dataset.SpectreGraphDataModule(cfg)
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name!r}")
 

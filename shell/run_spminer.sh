@@ -28,15 +28,30 @@ case "$DATASET" in
     zinc)     EXPERIMENT="zinc"     ;;
     moses)    EXPERIMENT="moses"    ;;
     guacamol) EXPERIMENT="guacamol" ;;
+    planar)   EXPERIMENT="planar"   ;;
+    sbm)      EXPERIMENT="sbm"      ;;
     *)
         echo "ERROR: Unknown dataset '$DATASET'."
-        echo "Usage: $0 [qm9|zinc|moses|guacamol]"
+        echo "Usage: $0 [qm9|zinc|moses|guacamol|planar|sbm]"
         exit 1
         ;;
 esac
 
 NX_GRAPHS_PATH="$DEFOG_ROOT/data/$DATASET/training_graphs_nx.pkl"
 MOTIFS_PATH="$DEFOG_ROOT/data/$DATASET/spminer_motifs.pkl"
+
+# ── Set maximum & minimum subgraph size ──────────────────────────────────────
+
+case "$DATASET" in 
+    planar) 
+        MIN_PATTERN_SIZE=5
+        MAX_PATTERN_SIZE=8
+        ;;
+    *)
+        MIN_PATTERN_SIZE=3
+        MAX_PATTERN_SIZE=6
+        ;;
+esac
 
 # ── Step 1: Export training graphs (DeFoG env) ───────────────────────────────
 echo "=== Step 1: Exporting $DATASET training graphs to NetworkX ==="
@@ -46,6 +61,7 @@ echo ""
 
 $DEFOG_PYTHON "$DEFOG_ROOT/scripts/export_nx_graphs.py" \
     +experiment="$EXPERIMENT" \
+    "dataset=$DATASET" \
     hydra.job.chdir=False \
     "model.spminer_nx_graphs_path=$NX_GRAPHS_PATH"
 
@@ -60,7 +76,9 @@ $SPMINER_PYTHON "$DEFOG_ROOT/scripts/mine_motifs.py" \
     --spminer_root  "$SPMINER_ROOT" \
     --nx_graphs_path "$NX_GRAPHS_PATH" \
     --out_path       "$MOTIFS_PATH" \
-    --dataset_name   "$DATASET"
+    --dataset_name   "$DATASET" \
+    --max_pattern_size "$MAX_PATTERN_SIZE" \
+    --min_pattern_size "$MIN_PATTERN_SIZE"
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""

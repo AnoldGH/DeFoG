@@ -57,7 +57,7 @@ def parse_args():
     p.add_argument(
         "--dataset_name",
         default="qm9",
-        choices=["qm9", "zinc", "moses", "guacamol"],
+        choices=["qm9", "zinc", "moses", "guacamol", "planar", "sbm"],
         help="Dataset name — controls neighborhood size defaults",
     )
     p.add_argument(
@@ -87,12 +87,19 @@ def parse_args():
 # ── Neighborhood size defaults per dataset ───────────────────────────────────
 
 # Tuned so that max_neighborhood_size <= dataset max_n_nodes.
-# QM9 (no-H): max 9 nodes. ZINC: max 38. MOSES: max 27. Guacamol: max 88.
+# Molecular datasets:
+#   QM9 (no-H): max 9 nodes. ZINC: max 38. MOSES: max 27. Guacamol: max 88.
+# Spectre (synthetic structural) datasets — neighborhoods sized to roughly
+# half the mean graph size so SPMiner can sample multiple distinct
+# neighborhoods per graph:
+#   Planar: mean ~64 nodes. SBM: mean ~104 nodes.
 _NEIGH_DEFAULTS = {
     "qm9":      (4,  8),
     "zinc":     (8, 25),
     "moses":    (8, 20),
     "guacamol": (10, 35),
+    "planar":   (15, 40),
+    "sbm":      (20, 60),
 }
 
 
