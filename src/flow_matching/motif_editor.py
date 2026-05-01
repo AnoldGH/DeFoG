@@ -143,3 +143,151 @@ def add_rings(
             node_mask = node_mask | ring_pos_mask
 
     return PlaceHolder(X=X, E=E, y=graph.y), node_mask
+
+
+def add_motif_patterns(
+    graph: PlaceHolder,
+    node_mask: torch.Tensor,
+    motif_graphs: list,
+    limit_dist: PlaceHolder,
+    top_k: int = 3,
+) -> tuple:
+    """Attach arbitrary-topology motif patterns to a batch of graphs.
+
+    Each entry in motif_graphs[:top_k] is injected once per graph by occupying
+    free (padding) node slots.  Motif-internal edges follow the topology of the
+    corresponding nx.Graph; a single connecting edge links the motif's anchor
+    node to a uniformly sampled active node in the host graph.
+
+    Node and bond types are sampled from limit_dist.  The no-bond class (index 0)
+    is excluded when sampling actual bond types, mirroring the convention used
+    by add_rings.
+
+    The anchor node is identified by the node attribute "anchor" == 1.  If no
+    such attribute is present, node 0 (first in iteration order) is used.
+
+    Args:
+        graph:        PlaceHolder — X (B, N, dx) one-hot, E (B, N, N, de) one-hot,
+                      y (B, dy).
+        node_mask:    (B, N) bool — True = active node.
+        motif_graphs: list[nx.Graph] — mined patterns from SPMiner; each graph
+                      has node attribute "anchor"=1 on the attachment node.
+        limit_dist:   PlaceHolder — X (dx,) node-type marginals,
+                      E (de,) edge-type marginals with E[0] = no-bond probability.
+        top_k:        Number of patterns to inject (first top_k entries used).
+
+    Returns:
+        (modified PlaceHolder, updated node_mask)
+    """
+    B, N, dx = graph.X.shape
+    de = graph.E.shape[-1]
+    device = graph.X.device
+
+    X = graph.X.clone()       # (B, N, dx)
+    E = graph.E.clone()       # (B, N, N, de)
+    node_mask = node_mask.clone()  # (B, N) bool
+
+    # Bond distribution: exclude class 0 (no bond) and renormalise.
+    bond_dist = limit_dist.E.clone()
+    bond_dist[0] = 0.0
+    bond_dist = bond_dist / bond_dist.sum()  # (de,)
+
+    b_idx = torch.arange(B, device=device)  # (B,)
+
+    for motif_nx in motif_graphs[:top_k]:
+        # Build a stable node ordering and a reverse look-up.
+        nodes = list(motif_nx.nodes())
+        motif_size = len(nodes)
+        if motif_size == 0:
+            continue
+        node_to_rank = {n: i for i, n in enumerate(nodes)}
+
+        # Identify anchor node rank (default 0 when attribute is absent).
+        anchor_rank = 0
+        for n, attrs in motif_nx.nodes(data=True):
+            if attrs.get("anchor", 0) == 1:
+                anchor_rank = node_to_rank[n]
+                break
+
+        # ------------------------------------------------------------------
+        # Skip graphs that lack sufficient free slots.
+        # ------------------------------------------------------------------
+        free_nodes = N - node_mask.sum(dim=1)   # (B,)
+        can_add = free_nodes >= motif_size        # (B,) bool
+        if not can_add.any():
+            continue
+
+        # ------------------------------------------------------------------
+        # Identify the first motif_size free slots for every graph.
+        # free_rank[b, i] = 1-indexed rank of position i among free positions
+        # in graph b (0 if position i is currently active).
+        # ------------------------------------------------------------------
+        free_mask = ~node_mask                              # (B, N)
+        free_rank = free_mask.long().cumsum(dim=1)         # (B, N)
+
+        # motif_node_indices[b, k] = tensor position of motif node with rank k.
+        k_vals = torch.arange(1, motif_size + 1, device=device)   # (motif_size,)
+        matches = free_mask.unsqueeze(2) & (free_rank.unsqueeze(2) == k_vals)  # (B, N, motif_size)
+        motif_node_indices = matches.long().argmax(dim=1)           # (B, motif_size)
+
+        # Mask of positions that will become motif nodes.
+        motif_pos_mask = free_mask & (free_rank <= motif_size)  # (B, N)
+        motif_pos_mask = motif_pos_mask & can_add.unsqueeze(1)  # zero out skipped graphs
+
+        # ------------------------------------------------------------------
+        # Sample attachment point v (growing-graph: uniform over active nodes).
+        # ------------------------------------------------------------------
+        active_prob = node_mask.float()
+        active_prob = active_prob / active_prob.sum(dim=1, keepdim=True).clamp(min=1)
+        v = active_prob.multinomial(1).squeeze(1)   # (B,)
+
+        # Tensor position of the anchor node.
+        anchor_slot = motif_node_indices[:, anchor_rank]   # (B,)
+
+        # ------------------------------------------------------------------
+        # Sample node types for motif nodes and write into X.
+        # ------------------------------------------------------------------
+        node_probs = limit_dist.X.unsqueeze(0).unsqueeze(0).expand(B, motif_size, -1)
+        node_types = node_probs.reshape(B * motif_size, -1).multinomial(1).reshape(B, motif_size)
+        X_motif = F.one_hot(node_types, num_classes=dx).float()   # (B, motif_size, dx)
+
+        # Map each padded position to its corresponding motif-node feature
+        # via (free_rank - 1), which gives a 0-indexed rank among free slots.
+        rank0 = (free_rank - 1).clamp(min=0, max=motif_size - 1)  # (B, N)
+        rank0_exp = rank0.unsqueeze(2).expand(-1, -1, dx)          # (B, N, dx)
+        X_write = torch.gather(X_motif, 1, rank0_exp)              # (B, N, dx)
+        X = X + X_write * motif_pos_mask.unsqueeze(2).float()
+
+        # ------------------------------------------------------------------
+        # Write motif-internal edges (arbitrary topology from nx.Graph).
+        # One bond type is sampled independently per edge per graph.
+        # ------------------------------------------------------------------
+        for (u_n, v_n) in motif_nx.edges():
+            u_m = node_to_rank[u_n]
+            v_m = node_to_rank[v_n]
+            u_slot = motif_node_indices[:, u_m]   # (B,)
+            v_slot = motif_node_indices[:, v_m]   # (B,)
+
+            bond_type = bond_dist.unsqueeze(0).expand(B, -1).multinomial(1).squeeze(1)  # (B,)
+            E_bond = F.one_hot(bond_type, num_classes=de).float()   # (B, de)
+
+            act = can_add
+            E[b_idx[act], u_slot[act], v_slot[act]] = E_bond[act]
+            E[b_idx[act], v_slot[act], u_slot[act]] = E_bond[act]   # enforce symmetry
+
+        # ------------------------------------------------------------------
+        # Connecting edge: v (host graph) <-> anchor_slot (motif).
+        # ------------------------------------------------------------------
+        conn_type = bond_dist.unsqueeze(0).expand(B, -1).multinomial(1).squeeze(1)  # (B,)
+        E_conn = F.one_hot(conn_type, num_classes=de).float()   # (B, de)
+
+        act = can_add
+        E[b_idx[act], v[act], anchor_slot[act]] = E_conn[act]
+        E[b_idx[act], anchor_slot[act], v[act]] = E_conn[act]   # enforce symmetry
+
+        # ------------------------------------------------------------------
+        # Activate motif node slots.
+        # ------------------------------------------------------------------
+        node_mask = node_mask | motif_pos_mask
+
+    return PlaceHolder(X=X, E=E, y=graph.y), node_mask

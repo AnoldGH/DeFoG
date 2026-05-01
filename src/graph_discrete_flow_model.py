@@ -486,10 +486,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             assert isinstance(num_nodes, torch.Tensor)
             n_nodes = num_nodes
         n_max = int(torch.max(n_nodes).item())
-        # Inflate n_max so ring nodes have free slots to occupy.
-        if self.cfg.model.transition in ("motif_edited_A", "motif_edited_B"):
-            ring_budget = sum(rs * rc for rs, rc in self.cfg.model.motif_ring_specs)
-            n_max += ring_budget
+        # Inflate n_max so injected motif nodes have free slots to occupy.
+        n_max += self.noise_dist.node_budget
 
         # Build the masks
         arange = (
