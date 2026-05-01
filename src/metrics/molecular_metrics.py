@@ -208,6 +208,14 @@ class SamplingMolecularMetrics(nn.Module):
         edge_mae = self.edge_dist_mae.compute()
         valency_mae = self.valency_dist_mae.compute()
 
+        # Make MAE metrics parseable from stdout (in addition to W&B logging
+        # below). Used by colab/generate_curves.ipynb to build training curves
+        # from test runs without depending on the W&B API.
+        print(
+            f"BasicMetricsMAE: n_mae={n_mae:.6f} node_mae={node_mae:.6f} "
+            f"edge_mae={edge_mae:.6f} valency_mae={valency_mae:.6f}"
+        )
+
         ratios = compute_ratios(
             gen_metrics=to_log,
             ref_metrics=ref_metrics["test"] if test else ref_metrics["val"],
