@@ -25,8 +25,8 @@ except ModuleNotFoundError as e:
 
 try:
     import psi4
-except ModuleNotFoundError:
-    print("PSI4 not found")
+except (ModuleNotFoundError, ImportError):
+    print("PSI4 not found / not loadable")
 
 allowed_bonds = {
     "H": 1,
