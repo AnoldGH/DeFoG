@@ -330,14 +330,20 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             to_save = min(samples_left_to_save, bs)
             chains_save = min(chains_left_to_save, bs)
             num_chain_steps = min(self.number_chain_steps, self.sample_T)
+            # Pre-sample n_nodes so the cond vector's log_n reflects the graph
+            # being generated (restores training-time invariant: log_n agrees
+            # with node_mask). Pass the same n_nodes to sample_batch so the two
+            # stay in lockstep.
+            target_n_nodes = self.node_dist.sample_n(to_generate, self.device)
             subgraph_cond = self._build_subgraph_cond(
-                sub_feats, sub_mode, to_generate, graph_id
+                sub_feats, sub_mode, to_generate, graph_id,
+                target_n_nodes=target_n_nodes,
             )
             batch_t0 = time.time()
             cur_samples, cur_labels = self.sample_batch(
                 graph_id,
                 to_generate,
-                num_nodes=None,
+                num_nodes=target_n_nodes,
                 save_final=to_save,
                 keep_chain=chains_save,
                 number_chain_steps=num_chain_steps,
@@ -519,12 +525,17 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     return f
         return None
 
-    def _build_subgraph_cond(self, sub_feats, mode, bs, graph_id):
+    def _build_subgraph_cond(self, sub_feats, mode, bs, graph_id, target_n_nodes=None):
         """Construct subgraph_cond for a sample batch based on cfg.general.subgraph_*.
 
         Deterministic: seeded from train.seed + graph_id so each batch of an eval
         run is reproducible. Returns None for disabled / missing paths so the
         model falls back to the zero/null extra-feature branch.
+
+        If target_n_nodes is provided, the log_n tail of the returned cond
+        tensor is overwritten to reflect the size of the graph being generated,
+        not the training-graph idx that drove the pattern. This keeps the
+        train-time invariant (log_n in y agrees with node_mask) at eval time.
         """
         if sub_feats is None or mode in (None, "none", "null"):
             return None
@@ -536,12 +547,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         g = torch.Generator().manual_seed(seed)
         if mode == "idx":
             idx = torch.randint(0, N, (bs,), generator=g)
-            return iu.from_idx(sub_feats, idx, device)
-        if mode == "idx_max":
+            cond = iu.from_idx(sub_feats, idx, device)
+        elif mode == "idx_max":
             k = int(self.cfg.general.get("subgraph_inference_k", 3))
             idx_matrix = torch.randint(0, N, (bs, k), generator=g)
-            return iu.from_idx_max(sub_feats, idx_matrix, device)
-        if mode == "anchor":
+            cond = iu.from_idx_max(sub_feats, idx_matrix, device)
+        elif mode == "anchor":
             # TODO: placeholder — generates a random 64-d "motif" vector per
             # sample. Not a real controllability experiment: (a) should accept a
             # user-supplied motif embedding via config/file, and (b) layout
@@ -550,13 +561,30 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             # See SubgraphEmbeddingFeatures._pattern_for single-anchor branch.
             anchor = torch.randn(bs, sub_feats.hidden_dim, generator=g)
             default_n = int(sub_feats.n_nodes.float().median().item())
-            n_nodes = torch.full(
+            n_fallback = torch.full(
                 (bs,),
                 int(self.cfg.general.get("subgraph_inference_n_nodes", default_n)),
                 dtype=torch.long,
             )
-            return iu.from_anchor_emb(sub_feats, anchor, n_nodes, device)
-        raise ValueError(f"Unknown subgraph_inference_mode: {mode}")
+            cond = iu.from_anchor_emb(sub_feats, anchor, n_fallback, device)
+        else:
+            raise ValueError(f"Unknown subgraph_inference_mode: {mode}")
+
+        # Opt-in log_n coherence override: replaces the scalar log_n (if present)
+        # with log(target_n_nodes)/log_max_n. Experiment 6c showed this hurts
+        # for idx-driven patterns (breaks a learned idx↔log_n association), so
+        # default is off — tails come from the training-idx values built by
+        # inference_utils. Enable via +general.subgraph_eval_override_log_n=true.
+        if (
+            target_n_nodes is not None
+            and sub_feats.include_log_n
+            and bool(self.cfg.general.get("subgraph_eval_override_log_n", False))
+        ):
+            tn = target_n_nodes.to(device).float()
+            # log_n is the first extra-scalar slot; log_e (if present) comes after.
+            log_n_col = sub_feats.pattern_dim
+            cond[:, log_n_col] = torch.log(tn) / sub_feats.log_max_n
+        return cond
 
     @torch.no_grad()
     def sample_batch(

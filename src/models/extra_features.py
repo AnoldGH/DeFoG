@@ -54,9 +54,14 @@ class SubgraphEmbeddingFeatures:
         aggregation_prob=0.2,
         aggregation_k_max=3,
         anchor_aug_prob=0.3,
+        include_log_n=True,
+        include_log_e=False,
     ):
         data = torch.load(emb_path, weights_only=False)
         self.n_nodes = data["n_nodes"].long()  # [N]
+        self.n_edges = data.get("n_edges", None)
+        if self.n_edges is not None:
+            self.n_edges = self.n_edges.long()
         self.per_anchor = data.get("per_anchor", None)  # list of [n_i, S, 64]
         if self.per_anchor is None:
             raise ValueError(
@@ -70,8 +75,19 @@ class SubgraphEmbeddingFeatures:
         n_red = len(self.reductions)
         n_sizes = len(self.sizes)
         self.pattern_dim = n_red * n_sizes * self.hidden_dim
-        self.feature_dim = self.pattern_dim + 1
+        self.include_log_n = bool(include_log_n)
+        self.include_log_e = bool(include_log_e)
+        if self.include_log_e and self.n_edges is None:
+            raise ValueError(
+                "include_log_e=True but emb file has no 'n_edges'. "
+                "Run integration/scripts/phase6d_add_n_edges.py first."
+            )
+        self.n_extra = int(self.include_log_n) + int(self.include_log_e)
+        self.feature_dim = self.pattern_dim + self.n_extra
         self.log_max_n = math.log(float(self.n_nodes.max().item()))
+        self.log_max_e = (
+            math.log(float(self.n_edges.max().item())) if self.include_log_e else None
+        )
         self.cfg_dropout = cfg_dropout
         self.aggregation_prob = aggregation_prob
         self.aggregation_k_max = aggregation_k_max
@@ -91,6 +107,25 @@ class SubgraphEmbeddingFeatures:
     def _log_n(self, idx):
         return torch.log(self.n_nodes[idx].float()) / self.log_max_n
 
+    def _log_e(self, idx):
+        return torch.log(self.n_edges[idx].float().clamp(min=1)) / self.log_max_e
+
+    def idx_tail(self, idx):
+        """Scalar tail per row for the given training-graph indices.
+
+        Returns [bs, n_extra] — empty (zero-width) tensor if no tail scalars are
+        configured. Used by inference_utils to build cond vectors that match
+        the training-time feature layout.
+        """
+        parts = []
+        if self.include_log_n:
+            parts.append(self._log_n(idx))
+        if self.include_log_e:
+            parts.append(self._log_e(idx))
+        if not parts:
+            return torch.zeros(idx.shape[0], 0)
+        return torch.stack(parts, dim=-1)
+
     def _pattern_for(self, gid, use_random_anchor):
         """Return a [pattern_dim] tensor for graph `gid` (CPU)."""
         if use_random_anchor and self.per_anchor is not None:
@@ -101,13 +136,27 @@ class SubgraphEmbeddingFeatures:
             return single.repeat(len(self.reductions))  # [n_red*S*H]
         return self.precomputed[gid]  # [n_red*S*H]
 
+    def _tail_for(self, gid):
+        """Return the scalar tail (shape [n_extra]) for a single graph id."""
+        parts = []
+        if self.include_log_n:
+            parts.append(torch.log(self.n_nodes[gid].float()) / self.log_max_n)
+        if self.include_log_e:
+            parts.append(
+                torch.log(self.n_edges[gid].float().clamp(min=1)) / self.log_max_e
+            )
+        if not parts:
+            return torch.zeros(0)
+        return torch.stack(parts, dim=0)
+
     def _build_row(self, own_gid, N_total):
-        """Sample one row: returns ([pattern_dim], scalar log_n)."""
+        """Sample one row: returns ([pattern_dim], [n_extra] tail)."""
         r = float(torch.rand(1).item())
-        own_log_n = self._log_n(own_gid)
+        own_tail = self._tail_for(own_gid)
 
         if r < self.cfg_dropout:
-            return torch.zeros(self.pattern_dim), torch.zeros(())  # null row (own log_n dropped too)
+            # Null row: pattern zeroed AND tail zeroed (CFG-dropout covers all).
+            return torch.zeros(self.pattern_dim), torch.zeros_like(own_tail)
 
         use_rand_anchor = float(torch.rand(1).item()) < self.anchor_aug_prob
         own_pat = self._pattern_for(own_gid, use_rand_anchor)
@@ -121,23 +170,23 @@ class SubgraphEmbeddingFeatures:
                 pats.append(self._pattern_for(g, use_ra))
             own_pat = torch.stack(pats, dim=0).max(dim=0).values
 
-        return own_pat, own_log_n
+        return own_pat, own_tail
 
     def _training_lookup(self, idx, device):
         N_total = self.precomputed.shape[0]
-        pat_rows, size_rows = [], []
+        pat_rows, tail_rows = [], []
         for gid in idx.tolist():
-            pat, log_n = self._build_row(int(gid), N_total)
+            pat, tail = self._build_row(int(gid), N_total)
             pat_rows.append(pat)
-            size_rows.append(log_n)
-        pat = torch.stack(pat_rows, dim=0).to(device)  # [bs, S*64]
-        log_n = torch.stack(size_rows, dim=0).unsqueeze(-1).to(device)  # [bs, 1]
-        return torch.cat([pat, log_n], dim=-1).float()
+            tail_rows.append(tail)
+        pat = torch.stack(pat_rows, dim=0).to(device)  # [bs, pattern_dim]
+        tail = torch.stack(tail_rows, dim=0).to(device)  # [bs, n_extra]
+        return torch.cat([pat, tail], dim=-1).float()
 
     def _deterministic_lookup(self, idx, device):
         vec = self.precomputed[idx].to(device)  # [bs, pattern_dim]
-        log_n = self._log_n(idx).to(device).unsqueeze(-1)  # [bs, 1]
-        return torch.cat([vec, log_n], dim=-1).float()
+        tail = self.idx_tail(idx.cpu()).to(device)  # [bs, n_extra]
+        return torch.cat([vec, tail], dim=-1).float()
 
     def __call__(self, noisy_data):
         X = noisy_data["X_t"]
